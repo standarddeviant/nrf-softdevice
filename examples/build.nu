@@ -1,20 +1,24 @@
 
 def main [] {
-
   let INFO = $"\n(ansi green_bold)INFO:"
 
+  echo $'($INFO) Please choose which binary to build(ansi reset)'
   # read src/bin 
   let src_bin_list = (ls ([. src bin *rs] | path join)).name
+  echo $'yo, src_bin_list = ($src_bin_list)'
+
   let select_list = (
     $src_bin_list | each {
       |x|
       $x | (parse -r '(?P<noext>\w+)\.rs').noext.0
     }
   )
-  echo $select_list
-  echo $select_list.0
+  echo $'select_list = ($select_list)'
+  echo 'Select which bin to build'
+  echo ($select_list | describe)
+  let name = ($select_list | input list)
 
-  let name = $select_list | input list 'Select which bin to build'
+
   let bpath = [.. target thumbv7em-none-eabihf release $name] | path join
   let hpath = [. $'($name).hex'] | path join
 
