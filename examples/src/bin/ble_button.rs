@@ -7,20 +7,61 @@ mod example_common;
 use core::any::Any;
 use core::mem;
 
-use cortex_m::prelude::{_embedded_hal_Pwm, _embedded_hal_PwmPin};
+use cortex_m::prelude::_embedded_hal_digital_InputPin;
 use defmt::{info, *};
+use {defmt_rtt as _, panic_probe as _};
+
 use embassy_executor::Spawner;
-use embassy_nrf::config::Config;
-use embassy_nrf::gpio::{AnyPin, Output};
-use embassy_nrf::Peripheral;
+// use embassy_sync::pubsub::{PubSubChannel, Publisher, Subscriber};
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::channel::{Channel, Receiver, Sender};
+
+use embassy_nrf::config;
+use embassy_nrf::gpio::Level::{self, High, Low};
+use embassy_nrf::gpio::{AnyPin, Input, Output, Pull};
 use embassy_nrf::interrupt::Priority;
-use embassy_nrf::pwm::{self, SequenceConfig, SequencePwm, SingleSequenceMode, SingleSequencer};
-use embassy_time::{Timer, Duration};
+use embassy_time::{Duration, Instant, Timer};
 use nrf_softdevice::ble::advertisement_builder::{
     Flag, LegacyAdvertisementBuilder, LegacyAdvertisementPayload, ServiceList, ServiceUuid16,
 };
 use nrf_softdevice::ble::{gatt_server, peripheral, OutOfBandReply};
 use nrf_softdevice::{raw, Softdevice};
+
+const BUTTON_CHANNEL_SIZE: usize = 8;
+
+#[derive(Clone, Copy)]
+enum ButtonState {
+    Unkown,
+    Pressed,
+    Released,
+}
+
+// // button debounce impl
+// pub struct Debouncer<'a> {
+//     input: Input<'a>,
+//     debounce: Duration,
+// }
+
+// impl<'a> Debouncer<'a> {
+//     pub fn new(input: Input<'a>, debounce: Duration) -> Self {
+//         Self { input, debounce }
+//     }
+
+//     pub async fn debounce(&mut self) -> Level {
+//         loop {
+//             let l1 = self.input.get_level();
+
+//             self.input.wait_for_any_edge().await;
+
+//             Timer::after(self.debounce).await;
+
+//             let l2 = self.input.get_level();
+//             if l1 != l2 {
+//                 break l2;
+//             }
+//         }
+//     }
+// }
 
 #[embassy_executor::task]
 async fn softdevice_task(sd: &'static Softdevice) -> ! {
@@ -46,50 +87,44 @@ struct Server {
 }
 
 #[embassy_executor::task]
-async fn blinker(apin: AnyPin) {
+async fn led_task(apin: AnyPin) {
     let mut led = Output::new(
         apin,
         embassy_nrf::gpio::Level::Low,
-        embassy_nrf::gpio::OutputDrive::Standard
+        embassy_nrf::gpio::OutputDrive::Standard,
     );
     loop {
         led.set_high();
-        Timer::after(Duration::from_millis(5000)).await;
+        Timer::after(Duration::from_millis(500)).await;
         led.set_low();
         Timer::after(Duration::from_millis(500)).await;
     }
 }
 
+// NOTE: PubSubChannel has 'generic's
+// M = Mutex
+// T = Type
+// then...
+// CAPS, SUBS, and PUBS
+// So (5) 'generic's in total
 
 #[embassy_executor::task]
-async fn fader(pwmInst: impl pwm::Instance, apin: AnyPin)
-{
-    let seq_words: [u16; 5] = [1000, 250, 100, 50, 0];
-
-    let mut config = pwm::Config::default();
-    config.prescaler = pwm::Prescaler::Div128;
-    // 1 period is 1000 * (128/16mhz = 0.000008s = 0.008ms) = 8us
-    // but say we want to hold the value for 5000ms
-    // so we want to repeat our value as many times as necessary until 5000ms passes
-    // want 5000/8 = 625 periods total to occur, so 624 (we get the one period for free remember)
-    let mut seq_config = SequenceConfig::default();
-    seq_config.refresh = 624;
-    // thus our sequence takes 5 * 5000ms or 25 seconds
-
-    let mut pwm = unwrap!(SequencePwm::new_1ch(pwmInst, apin, config));
-    let sequencer = SingleSequencer::new(&mut pwm, &seq_words, seq_config);
+async fn button_task(
+    mut sender: Sender<'static, ThreadModeRawMutex, (Instant, ButtonState), BUTTON_CHANNEL_SIZE>,
+    mut btn: Input<'static, AnyPin>, // debounce_dur: Duration
+) {
     loop {
-        unwrap!(sequencer.start(SingleSequenceMode::Times(1)));
+        btn.wait_for_low().await;
+        sender.send((Instant::now(), ButtonState::Pressed));
+        info!("Button pressed!");
 
-        // we can abort a sequence if we need to before its complete with pwm.stop()
-        // or stop is also implicitly called when the pwm peripheral is dropped
-        // when it goes out of scope
-        Timer::after_millis(20000).await;
-        info!("pwm stopped early!");
+        btn.wait_for_high().await;
+        sender.send((Instant::now(), ButtonState::Released));
+        info!("Button released!");
     }
 }
 
-fn config() -> embassy_nrf::config::Config {
+fn nrf_config() -> embassy_nrf::config::Config {
     let mut config = embassy_nrf::config::Config::default();
     config.gpiote_interrupt_priority = Priority::P2;
     // it seems like setting config.time_interrupt_priority is critical...
@@ -98,24 +133,25 @@ fn config() -> embassy_nrf::config::Config {
     config
 }
 
+static BUTTON_CHANNEL: Channel<ThreadModeRawMutex, (Instant, ButtonState), BUTTON_CHANNEL_SIZE> = Channel::new();
+// static LED_CHANNEL: Channel<ThreadModeRawMutex, u32, LED_CHANNEL_SIZE> = Channel::new();
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     info!("Hello World!");
     // make peripheral singletons
-    let p = embassy_nrf::init(config());
+    let p = embassy_nrf::init(nrf_config());
 
-    // create + feed LED-GPIO task w/ red LED = P0_26
-    unwrap!(spawner.spawn(blinker(
-        AnyPin::from(p.P0_26)
-    )));
+    // 1. Spawn LED Task w/ red LED = P0_26
+    unwrap!(spawner.spawn(led_task(AnyPin::from(p.P0_26))));
 
-    // create + feed LED-PWM task w/ red LED = P0_26
-    unwrap!(spawner.spawn(fader(
-        p.PWM0,
-        AnyPin::from(p.P0_06)
+    // 2. Spawn Button task w/ ???
+    let button = Input::new(AnyPin::from(p.P0_12), Pull::Up);
+    // let mut btn_pubsub = PubSubChannel::<NoopRawMutex, (Instant, ButtonState), 4, 4, 4>::new();
+    unwrap!(spawner.spawn(button_task(
+        BUTTON_CHANNEL.sender(),
+        button // Duration::from_millis(20)
     )));
-    // async fn fader(apwm: Pwm, apin: AnyPin)
- 
 
     // create soft device config
     let config = nrf_softdevice::Config {
@@ -198,8 +234,7 @@ async fn main(spawner: Spawner) {
                 FooServiceEvent::FooCccdWrite {
                     indications,
                     notifications,
-                }
-                => {
+                } => {
                     info!("foo indications: {}, notifications: {}", indications, notifications)
                 }
             },
