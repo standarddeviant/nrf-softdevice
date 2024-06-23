@@ -7,28 +7,36 @@ mod example_common;
 use core::mem;
 
 use defmt::{info, *};
+use embassy_nrf::saadc::Time;
 use {defmt_rtt as _, panic_probe as _};
 
 use embassy_executor::Spawner;
 // use embassy_sync::pubsub::{PubSubChannel, Publisher, Subscriber};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
-use embassy_sync::channel::{Channel, Sender};
+use embassy_sync::channel::{Channel, ReceiveFuture, Receiver, Sender};
 
 use embassy_nrf::gpio::{AnyPin, Input, Output, Pull};
 use embassy_nrf::interrupt::Priority;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, TimeoutError, Timer};
 use nrf_softdevice::ble::advertisement_builder::{
     Flag, LegacyAdvertisementBuilder, LegacyAdvertisementPayload, ServiceList, ServiceUuid16,
 };
-use nrf_softdevice::ble::{gatt_server, peripheral};
+use nrf_softdevice::ble::{gatt_server, peripheral, Connection};
 use nrf_softdevice::{raw, Softdevice};
 
 const BUTTON_CHANNEL_SIZE: usize = 8;
+const LED_CHANNEL_SIZE: usize = 8;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ButtonState {
     Pressed,
     Released,
+}
+
+#[derive(Clone, Copy, Debug, Format)]
+enum LedAction {
+    BleAdvertise,
+    BleConnected,
 }
 
 // // button debounce impl
@@ -82,13 +90,19 @@ struct Server {
 }
 
 #[embassy_executor::task]
-async fn led_task(apin: AnyPin) {
+async fn led_task(
+    receiver: Receiver<'static, ThreadModeRawMutex, (Instant, LedAction), LED_CHANNEL_SIZE>,
+    apin: AnyPin,
+) {
     let mut led = Output::new(
         apin,
         embassy_nrf::gpio::Level::Low,
         embassy_nrf::gpio::OutputDrive::Standard,
     );
     loop {
+        if let Ok((t, action)) = receiver.try_receive() {
+            info!("Hey, we received {:?} @ t = {:?}", action, t);
+        }
         led.set_high();
         Timer::after(Duration::from_millis(500)).await;
         led.set_low();
@@ -129,27 +143,21 @@ fn nrf_config() -> embassy_nrf::config::Config {
 }
 
 static BUTTON_CHANNEL: Channel<ThreadModeRawMutex, (Instant, ButtonState), BUTTON_CHANNEL_SIZE> = Channel::new();
-// static LED_CHANNEL: Channel<ThreadModeRawMutex, u32, LED_CHANNEL_SIZE> = Channel::new();
+static LED_CHANNEL: Channel<ThreadModeRawMutex, (Instant, LedAction), LED_CHANNEL_SIZE> = Channel::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    info!("Hello World!");
+    info!("I am a BLE Button!");
+
+    // start 0. set up variables
+    // start 0. set up variables
+    // start 0. set up variables
+
     // make peripheral singletons
     let p = embassy_nrf::init(nrf_config());
 
-    // 1. Spawn LED Task w/ red LED = P0_26
-    unwrap!(spawner.spawn(led_task(AnyPin::from(p.P0_26))));
-
-    // 2. Spawn Button task w/ ???
-    let button = Input::new(AnyPin::from(p.P0_12), Pull::Up);
-    // let mut btn_pubsub = PubSubChannel::<NoopRawMutex, (Instant, ButtonState), 4, 4, 4>::new();
-    unwrap!(spawner.spawn(button_task(
-        BUTTON_CHANNEL.sender(),
-        button // Duration::from_millis(20)
-    )));
-
     // create soft device config
-    let config = nrf_softdevice::Config {
+    let nrf_sd_config = nrf_softdevice::Config {
         clock: Some(raw::nrf_clock_lf_cfg_t {
             source: raw::NRF_CLOCK_LF_SRC_RC as u8,
             rc_ctiv: 16,
@@ -178,15 +186,15 @@ async fn main(spawner: Spawner) {
         ..Default::default()
     };
 
-    // start softdevice
-    let sd = Softdevice::enable(&config);
+    // start softdevice task in background
+    let sd = Softdevice::enable(&nrf_sd_config);
     let server = unwrap!(Server::new(sd));
     unwrap!(spawner.spawn(softdevice_task(sd)));
 
     static ADV_DATA: LegacyAdvertisementPayload = LegacyAdvertisementBuilder::new()
         .flags(&[Flag::GeneralDiscovery, Flag::LE_Only])
         .services_16(ServiceList::Complete, &[ServiceUuid16::BATTERY])
-        .full_name("HelloRust")
+        .full_name("BLE-Button")
         .build();
 
     static SCAN_DATA: LegacyAdvertisementPayload = LegacyAdvertisementBuilder::new()
@@ -196,13 +204,58 @@ async fn main(spawner: Spawner) {
         )
         .build();
 
+    let led_sender = LED_CHANNEL.sender();
+    // end 0. set up variables
+    // end 0. set up variables
+    // end 0. set up variables
+
+    // 1. Spawn LED Task w/ LED = P0_26
+    unwrap!(spawner.spawn(led_task(LED_CHANNEL.receiver(), AnyPin::from(p.P0_26))));
+
+    // 2. Spawn Button task (for 'already-awake-presses') w/ ???
+    let button_obj = Input::new(AnyPin::from(p.P0_12), Pull::Up);
+    // let mut btn_pubsub = PubSubChannel::<NoopRawMutex, (Instant, ButtonState), 4, 4, 4>::new();
+    unwrap!(spawner.spawn(button_task(
+        BUTTON_CHANNEL.sender(),
+        button_obj,
+        // TODO - add debounce dur
+    )));
+
+    // 3. Configure 'wake-from-gpio' on button GPIO
+    // TODO - how do I do this???
+
+    // 4. Use 'main' task to operate BLE
+    //    TODO - discover a clean way to process BLE hardware+events in another task
+    //           NOTE: needs to work w/ rust's data owernship model
     loop {
-        let config = peripheral::Config::default();
+        let mut nrf_sd_periph_config = peripheral::Config::default();
+        nrf_sd_periph_config.timeout = Some((10_000 / 10) as u16);
         let adv = peripheral::ConnectableAdvertisement::ScannableUndirected {
             adv_data: &ADV_DATA,
             scan_data: &SCAN_DATA,
         };
-        let conn = unwrap!(peripheral::advertise_connectable(sd, adv, &config).await);
+        let conn_try = peripheral::advertise_connectable(sd, adv, &nrf_sd_periph_config).await;
+        let conn = conn_try.unwrap_or_else(|adv_err| {
+            match adv_err {
+                peripheral::AdvertiseError::Timeout => {
+                    /* TODO :
+                     *     1. configure button to wake from sleep
+                     *     2. put micro to sleep
+                     */
+                }
+                peripheral::AdvertiseError::NoFreeConn => {}
+                peripheral::AdvertiseError::Raw(r) => {}
+            }
+            // NOTE: here we yield/return a bogus handle to make rust compiler happy
+            // NOTE: the purpose is to 'go to deep sleep' and have button wake us up later
+            unwrap!(Connection::from_handle(0 as u16))
+        });
+
+        // if we get here, that means we didn't go to sleep + reset (:
+        // so - it's okay to unwrap this connection
+        //      OR
+        //      we have an unhandled error above... /:
+        // let conn = unwrap!(conn);
 
         info!("advertising done!");
 
