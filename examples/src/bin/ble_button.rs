@@ -4,34 +4,29 @@
 #[path = "../example_common.rs"]
 mod example_common;
 
-use core::any::Any;
 use core::mem;
 
-use cortex_m::prelude::_embedded_hal_digital_InputPin;
 use defmt::{info, *};
 use {defmt_rtt as _, panic_probe as _};
 
 use embassy_executor::Spawner;
 // use embassy_sync::pubsub::{PubSubChannel, Publisher, Subscriber};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
-use embassy_sync::channel::{Channel, Receiver, Sender};
+use embassy_sync::channel::{Channel, Sender};
 
-use embassy_nrf::config;
-use embassy_nrf::gpio::Level::{self, High, Low};
 use embassy_nrf::gpio::{AnyPin, Input, Output, Pull};
 use embassy_nrf::interrupt::Priority;
 use embassy_time::{Duration, Instant, Timer};
 use nrf_softdevice::ble::advertisement_builder::{
     Flag, LegacyAdvertisementBuilder, LegacyAdvertisementPayload, ServiceList, ServiceUuid16,
 };
-use nrf_softdevice::ble::{gatt_server, peripheral, OutOfBandReply};
+use nrf_softdevice::ble::{gatt_server, peripheral};
 use nrf_softdevice::{raw, Softdevice};
 
 const BUTTON_CHANNEL_SIZE: usize = 8;
 
 #[derive(Clone, Copy)]
 enum ButtonState {
-    Unkown,
     Pressed,
     Released,
 }
@@ -110,7 +105,7 @@ async fn led_task(apin: AnyPin) {
 
 #[embassy_executor::task]
 async fn button_task(
-    mut sender: Sender<'static, ThreadModeRawMutex, (Instant, ButtonState), BUTTON_CHANNEL_SIZE>,
+    sender: Sender<'static, ThreadModeRawMutex, (Instant, ButtonState), BUTTON_CHANNEL_SIZE>,
     mut btn: Input<'static, AnyPin>, // debounce_dur: Duration
 ) {
     loop {
@@ -172,9 +167,6 @@ async fn main(spawner: Spawner) {
         gap_role_count: Some(raw::ble_gap_cfg_role_count_t {
             adv_set_count: 1,
             periph_role_count: 3,
-            central_role_count: 3,
-            central_sec_count: 0,
-            _bitfield_1: raw::ble_gap_cfg_role_count_t::new_bitfield_1(0),
         }),
         gap_device_name: Some(raw::ble_gap_cfg_device_name_t {
             p_value: b"HelloRust" as *const u8 as _,
