@@ -115,11 +115,11 @@ async fn button_task(
 ) {
     loop {
         btn.wait_for_low().await;
-        sender.send((Instant::now(), ButtonState::Pressed));
+        sender.send((Instant::now(), ButtonState::Pressed)).await;
         info!("Button pressed!");
 
         btn.wait_for_high().await;
-        sender.send((Instant::now(), ButtonState::Released));
+        sender.send((Instant::now(), ButtonState::Released)).await;
         info!("Button released!");
     }
 }
