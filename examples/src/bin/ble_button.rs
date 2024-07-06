@@ -8,12 +8,13 @@ use core::mem;
 
 use defmt::{info, *};
 use embassy_nrf::saadc::Time;
+use embassy_sync::pubsub::publisher::Pub;
 use {defmt_rtt as _, panic_probe as _};
 
 use embassy_executor::Spawner;
-// use embassy_sync::pubsub::{PubSubChannel, Publisher, Subscriber};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::{Channel, ReceiveFuture, Receiver, Sender};
+use embassy_sync::pubsub::{subscriber, PubSubChannel, Publisher, Subscriber, WaitResult};
 
 use embassy_nrf::gpio::{AnyPin, Input, Output, Pull};
 use embassy_nrf::interrupt::Priority;
@@ -24,8 +25,8 @@ use nrf_softdevice::ble::advertisement_builder::{
 use nrf_softdevice::ble::{gatt_server, peripheral, Connection};
 use nrf_softdevice::{raw, Softdevice};
 
-const BUTTON_CHANNEL_SIZE: usize = 8;
-const LED_CHANNEL_SIZE: usize = 8;
+const BUTTON_EVENTS_SIZE: usize = 8;
+const SYSTEM_STATE_EVENTS_SIZE: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 enum ButtonState {
@@ -33,9 +34,10 @@ enum ButtonState {
     Released,
 }
 
-#[derive(Clone, Copy, Debug, Format)]
-enum LedAction {
-    BleAdvertise,
+#[derive(Clone, Copy, Debug)]
+enum SystemState {
+    Sleeping,
+    BleAdvertising,
     BleConnected,
 }
 
@@ -91,7 +93,7 @@ struct Server {
 
 #[embassy_executor::task]
 async fn led_task(
-    receiver: Receiver<'static, ThreadModeRawMutex, (Instant, LedAction), LED_CHANNEL_SIZE>,
+    mut system_states: Subscriber<'static, ThreadModeRawMutex, (Instant, SystemState), SYSTEM_STATE_EVENTS_SIZE, 4, 4>,
     apin: AnyPin,
 ) {
     let mut led = Output::new(
@@ -100,13 +102,21 @@ async fn led_task(
         embassy_nrf::gpio::OutputDrive::Standard,
     );
     loop {
-        if let Ok((t, action)) = receiver.try_receive() {
-            info!("Hey, we received {:?} @ t = {:?}", action, t);
-        }
+        // let (t, action) = system_states.next_message();
+        // let a: WaitResult<(Instant, SystemState)> = system_states.next_message().await;
+        let a: WaitResult<(Instant, SystemState)> = system_states.next_message().await;
+        // TODO - handle message a
+
+        // let (t: Instant, state: SystemState) = a.into();
+        // let b = a
+        // let c = b.
+        // if let Ok((t, action)) = system_states.next_message().await;
+        //     info!("Hey, we received {:?} @ t = {:?}", action, t);
+        // }
         led.set_high();
-        Timer::after(Duration::from_millis(500)).await;
+        Timer::after(Duration::from_secs(2)).await;
         led.set_low();
-        Timer::after(Duration::from_millis(500)).await;
+        Timer::after(Duration::from_millis(8)).await;
     }
 }
 
@@ -119,16 +129,17 @@ async fn led_task(
 
 #[embassy_executor::task]
 async fn button_task(
-    sender: Sender<'static, ThreadModeRawMutex, (Instant, ButtonState), BUTTON_CHANNEL_SIZE>,
+    // sender: Sender<'static, ThreadModeRawMutex, (Instant, ButtonState), BUTTON_EVENTS_SIZE>,
+    state_pub: Publisher<'static, ThreadModeRawMutex, (Instant, ButtonState), BUTTON_EVENTS_SIZE, 4, 4>,
     mut btn: Input<'static, AnyPin>, // debounce_dur: Duration
 ) {
     loop {
         btn.wait_for_low().await;
-        sender.send((Instant::now(), ButtonState::Pressed)).await;
+        state_pub.publish((Instant::now(), ButtonState::Pressed)).await;
         info!("Button pressed!");
 
         btn.wait_for_high().await;
-        sender.send((Instant::now(), ButtonState::Released)).await;
+        state_pub.publish((Instant::now(), ButtonState::Released)).await;
         info!("Button released!");
     }
 }
@@ -142,8 +153,10 @@ fn nrf_config() -> embassy_nrf::config::Config {
     config
 }
 
-static BUTTON_CHANNEL: Channel<ThreadModeRawMutex, (Instant, ButtonState), BUTTON_CHANNEL_SIZE> = Channel::new();
-static LED_CHANNEL: Channel<ThreadModeRawMutex, (Instant, LedAction), LED_CHANNEL_SIZE> = Channel::new();
+static BUTTON_EVENTS: PubSubChannel<ThreadModeRawMutex, (Instant, ButtonState), BUTTON_EVENTS_SIZE, 4, 4> =
+    PubSubChannel::new();
+static SYSTEM_STATE_EVENTS: PubSubChannel<ThreadModeRawMutex, (Instant, SystemState), SYSTEM_STATE_EVENTS_SIZE, 4, 4> =
+    PubSubChannel::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -204,19 +217,22 @@ async fn main(spawner: Spawner) {
         )
         .build();
 
-    let led_sender = LED_CHANNEL.sender();
+    let state_sub = SYSTEM_STATE_EVENTS.subscriber();
     // end 0. set up variables
     // end 0. set up variables
     // end 0. set up variables
 
     // 1. Spawn LED Task w/ LED = P0_26
-    unwrap!(spawner.spawn(led_task(LED_CHANNEL.receiver(), AnyPin::from(p.P0_26))));
+    unwrap!(spawner.spawn(led_task(
+        SYSTEM_STATE_EVENTS.subscriber().unwrap(),
+        AnyPin::from(p.P0_26)
+    )));
 
     // 2. Spawn Button task (for 'already-awake-presses') w/ ???
     let button_obj = Input::new(AnyPin::from(p.P0_12), Pull::Up);
     // let mut btn_pubsub = PubSubChannel::<NoopRawMutex, (Instant, ButtonState), 4, 4, 4>::new();
     unwrap!(spawner.spawn(button_task(
-        BUTTON_CHANNEL.sender(),
+        BUTTON_EVENTS.publisher().unwrap(),
         button_obj,
         // TODO - add debounce dur
     )));
@@ -252,11 +268,6 @@ async fn main(spawner: Spawner) {
         });
 
         // if we get here, that means we didn't go to sleep + reset (:
-        // so - it's okay to unwrap this connection
-        //      OR
-        //      we have an unhandled error above... /:
-        // let conn = unwrap!(conn);
-
         info!("advertising done!");
 
         // Run the GATT server on the connection. This returns when the connection gets disconnected.
